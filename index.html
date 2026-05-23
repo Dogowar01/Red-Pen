@@ -98,6 +98,165 @@ function computeDialogueMeta(text,wc){
   return{ratio:Math.round((dialogueWords/wc)*100),lineCount:m.length,dialogueWords,proseWords:wc-dialogueWords};
 }
 
+function computePatterns(text, wc) {
+  if (wc < 50) return null;
+  const sentences = splitSentences(text);
+  const words = tokenize(text);
+
+  // ── Rule of Three (tricolon) ──
+  // Matches "A, B, and C" or "A, B, C" where items are 2–40 chars each
+  const triRe = /([A-Za-z][^,;.!?]{1,50}),\s+([A-Za-z][^,;.!?]{1,50}),\s+(?:and\s+|or\s+)?([A-Za-z][^,;.!?\n]{1,50})/g;
+  const tricolons = [];
+  let m;
+  while ((m = triRe.exec(text)) !== null) {
+    const full = m[0].trim();
+    // Skip very short matches (likely just CSV data) and very long ones
+    if (full.length < 12 || full.length > 160) continue;
+    // Skip if items are single words (likely a plain list, not a rhetorical tricolon)
+    const items = [m[1].trim(), m[2].trim(), m[3].trim()];
+    const avgLen = items.reduce((a,b)=>a+b.split(' ').length,0)/3;
+    if (avgLen < 2) continue;
+    tricolons.push({ text: full, items });
+  }
+
+  // ── List rhythm stacking ──
+  // Sentences with 3+ comma groups (potential list stacking)
+  const listySentences = sentences.filter(s => (s.match(/,/g)||[]).length >= 3);
+  // Paragraphs with 2+ listy sentences (stacking risk)
+  const paragraphs = text.split(/\n\n+/);
+  const stackedParas = paragraphs.filter(p => {
+    const pSents = splitSentences(p);
+    return pSents.filter(s => (s.match(/,/g)||[]).length >= 3).length >= 2;
+  });
+  // Find sentences with parallel "X, Y, and Z and A, B, and C" double-stacking
+  const doubleStacks = sentences.filter(s => {
+    const m2 = s.match(/(?:[A-Za-z][^,]{1,40},\s*){2,}(?:and|or)\s+[A-Za-z]/g);
+    return m2 && m2.length >= 2;
+  });
+
+  // ── Simile / metaphor stacking ──
+  // Local proxy: "like a/an/the", "as X as", direct metaphor verbs ("was a", "were a" near noun phrases)
+  const simileRe = /\blike\s+(?:a|an|the)\s+\w+(?:\s+\w+){0,3}|\bas\s+\w+\s+as\s+(?:a|an|the)\s+\w+/gi;
+  const personRe = /\b(?:the\s+\w+\s+(?:whispered|howled|groaned|breathed|sang|danced|wept|laughed|screamed|clawed|reached|waited|watched|refused|demanded|offered|swallowed)|(?:darkness|silence|wind|rain|light|shadow|time|fear|grief|hope|sky|earth|fire|water|stone)\s+(?:swallowed|consumed|devoured|embraced|reached|clawed|pressed|wrapped|settled|crept|crawled|hunted|watched))/gi;
+  const allFigurative = [];
+  let fm;
+  const simileRe2 = new RegExp(simileRe.source, 'gi');
+  while ((fm = simileRe2.exec(text)) !== null) allFigurative.push({ text: fm[0], index: fm.index, type: 'simile' });
+  const personRe2 = new RegExp(personRe.source, 'gi');
+  while ((fm = personRe2.exec(text)) !== null) allFigurative.push({ text: fm[0], index: fm.index, type: 'personification' });
+  allFigurative.sort((a,b) => a.index - b.index);
+  // Find stacks: 2+ figurative devices within 100 chars of each other
+  const figStacks = [];
+  for (let i = 0; i < allFigurative.length - 1; i++) {
+    if (allFigurative[i+1].index - allFigurative[i].index <= 120) {
+      figStacks.push({ a: allFigurative[i], b: allFigurative[i+1],
+        context: text.slice(Math.max(0, allFigurative[i].index - 10), allFigurative[i+1].index + allFigurative[i+1].text.length + 10).trim()
+      });
+    }
+  }
+
+  // ── Contrast structures ("not X but Y") ──
+  const contrastRe = /\bnot\s+[^,;.!?\n]{3,50}(?:,\s+|\s+)but\s+[^,;.!?\n]{3,60}|\brather\s+than\s+[^,;.!?\n]{3,50}|\binstead\s+of\s+[^,;.!?\n]{3,50}(?:,\s+[^,;.!?\n]{3,50})?|\b(?:less|more)\s+\w+(?:\s+\w+)?\s+than\s+[^,;.!?\n]{3,40}/gi;
+  const contrasts = [];
+  while ((m = contrastRe.exec(text)) !== null) contrasts.push({ text: m[0].trim(), index: m.index });
+  const contrastStacks = [];
+  for (let i = 0; i < contrasts.length - 1; i++) {
+    if (contrasts[i+1].index - contrasts[i].index <= 300) {
+      contrastStacks.push([contrasts[i], contrasts[i+1]]);
+    }
+  }
+
+  // ── Clean pivot sentences ──
+  // Formulaic wrap-up/transition sentences AI loves: "With that,", "And so", "That changed everything" etc.
+  const pivotPatterns = [
+    /\bwith\s+that[,.]?\s/gi,
+    /\band\s+(?:just\s+)?(?:like\s+that|so)[,.]?\s/gi,
+    /\bin\s+the\s+end[,.]?\s/gi,
+    /\bafter\s+all[,.]?\s/gi,
+    /\bthat\s+(?:was\s+that|changed\s+everything|was\s+all|would\s+have\s+to\s+(?:be\s+)?enough|settled\s+it|did\s+it)[.!]/gi,
+    /\bit\s+was\s+(?:done|over|decided|settled|enough|time)\b/gi,
+    /\bnothing\s+(?:would\s+ever\s+)?(?:be\s+the\s+same|could\s+change\s+that|else\s+mattered)/gi,
+    /\beverything\s+(?:changed|was\s+different|had\s+changed)\b/gi,
+    /\b(?:she|he|they)\s+(?:didn't|did\s+not)\s+look\s+back\b/gi,
+    /\b(?:there\s+was\s+)?(?:no\s+going\s+back|no\s+turning\s+back|no\s+choice|no\s+other\s+(?:way|option))\b/gi,
+    /\bso\s+(?:it\s+was|be\s+it|it\s+went)\b[.!]/gi,
+    /\b(?:she|he|they)\s+had\s+(?:made\s+(?:her|his|their)\s+(?:choice|decision)|no\s+choice)\b/gi,
+    /\bthe\s+(?:die\s+was\s+cast|matter\s+was\s+(?:settled|closed))\b/gi,
+  ];
+  const pivots = [];
+  for (const re of pivotPatterns) {
+    let pm;
+    const re2 = new RegExp(re.source, 'gi');
+    while ((pm = re2.exec(text)) !== null) {
+      // Get surrounding sentence for context
+      const sentStart = Math.max(0, text.lastIndexOf('\n', pm.index) + 1);
+      const sentEnd = text.indexOf('\n', pm.index + pm[0].length);
+      const sentence = text.slice(sentStart, sentEnd === -1 ? pm.index + 80 : Math.min(sentEnd, pm.index + 100)).trim();
+      pivots.push({ text: pm[0].trim(), sentence: sentence.slice(0, 120), index: pm.index });
+    }
+  }
+  // Deduplicate by index proximity
+  const seenPivotIdx = new Set();
+  const uniquePivots = pivots.filter(p => {
+    const key = Math.floor(p.index / 20);
+    if (seenPivotIdx.has(key)) return false;
+    seenPivotIdx.add(key); return true;
+  }).sort((a,b) => a.index - b.index);
+
+  // ── Emotional shorthand stacking ──
+  // Pre-packaged emotional signals — fine once, AI-ish when stacked
+  const emotionShorthand = [
+    { re: /\b(?:his|her|their|my)\s+(?:heart)\s+(?:sank|pounded|raced|hammered|lurched|leapt|skipped a beat|dropped|clenched|constricted|ached|seized|stuttered|froze|stopped)/gi, label:'heart [verb]' },
+    { re: /\b(?:his|her|their|my)\s+(?:breath)\s+(?:caught|hitched|escaped|rushed out|held|stopped|came fast|came short)/gi, label:'breath [verb]' },
+    { re: /\b(?:his|her|their|my)\s+(?:stomach)\s+(?:dropped|churned|lurched|tightened|knotted|twisted|sank|turned|flipped)/gi, label:'stomach [verb]' },
+    { re: /\b(?:his|her|their|my)\s+(?:chest)\s+(?:tightened|constricted|ached|hurt|seized|heaved|compressed|caved)/gi, label:'chest [verb]' },
+    { re: /\b(?:his|her|their|my)\s+(?:throat)\s+(?:tightened|closed|constricted|burned|ached|went dry|knotted|swelled|seized)/gi, label:'throat [verb]' },
+    { re: /\b(?:his|her|their|my)\s+(?:jaw)\s+(?:clenched|tightened|set|dropped|locked|went tight)/gi, label:'jaw [verb]' },
+    { re: /\btears?\s+(?:pricked|burned|stung|welled|blurred|filled|fell|streamed|spilled|threatened|formed)/gi, label:'tears [verb]' },
+    { re: /\b(?:his|her|their|my)\s+eyes?\s+(?:burned|stung|pricked|widened|went wide|blurred|filled|grew hot|watered)/gi, label:'eyes [verb]' },
+    { re: /\b(?:a\s+)?(?:knot|lump)\s+(?:formed\s+in|rose\s+in|settled\s+in|sat\s+in|in)\s+(?:his|her|their|my)\s+(?:throat|chest|stomach)/gi, label:'knot/lump in throat' },
+    { re: /\b(?:heat|warmth|cold|chill|ice)\s+(?:rose|spread|flooded|crept|settled|washed|shot|ran|crawled)\s+(?:through|up|down|into|across)\s+(?:his|her|their|my)/gi, label:'physical sensation spread' },
+    { re: /\b(?:his|her|their|my)\s+(?:skin)\s+(?:prickled|crawled|tingled|burned|went cold|went hot|flushed)/gi, label:'skin [verb]' },
+    { re: /\b(?:his|her|their|my)\s+(?:hands?|fingers?)\s+(?:trembled|shook|went cold|went numb|clenched|curled)/gi, label:'hands/fingers [verb]' },
+    { re: /\b(?:a\s+)?(?:wave|surge|rush|flood)\s+of\s+(?:relief|dread|fear|guilt|shame|nausea|panic|anger|grief|sadness|sorrow|despair)/gi, label:'wave/surge of [emotion]' },
+  ];
+  const allShorthand = [];
+  for (const { re, label } of emotionShorthand) {
+    let em;
+    const re2 = new RegExp(re.source, 'gi');
+    while ((em = re2.exec(text)) !== null) allShorthand.push({ text: em[0].trim(), label, index: em.index });
+  }
+  allShorthand.sort((a,b) => a.index - b.index);
+  // Find stacks: 2+ within 200 words (~1200 chars)
+  const shorthandStacks = [];
+  const usedInStack = new Set();
+  for (let i = 0; i < allShorthand.length - 1; i++) {
+    if (allShorthand[i+1].index - allShorthand[i].index <= 1200) {
+      shorthandStacks.push({ a: allShorthand[i], b: allShorthand[i+1],
+        context: text.slice(Math.max(0, allShorthand[i].index - 20), allShorthand[i+1].index + allShorthand[i+1].text.length + 20).trim()
+      });
+      usedInStack.add(i); usedInStack.add(i+1);
+    }
+  }
+
+  return {
+    tricolons,
+    listySentences,
+    stackedParas,
+    doubleStacks,
+    allFigurative,
+    figStacks,
+    contrasts,
+    contrastStacks,
+    pivots: uniquePivots,
+    allShorthand,
+    shorthandStacks,
+    totalSentences: sentences.length,
+    totalWords: wc,
+  };
+}
+
+
 // ─── JSZip + IMPORT/EXPORT ────────────────────────────────────────────────────
 
 function loadJSZip(){
@@ -353,7 +512,7 @@ function TextInput({text,setText,wordCount,fileName,setFileName}){
 }
 
 function TabBar({active,onChange}){
-  const tabs=[["aiisms","AI-isms",true],["pacing","Pacing",false],["repeats","Repeats",false],["show-tell","Show vs Tell",true],["dialogue","Dialogue",true],["tension","Tension",true],["export","Export",false]];
+  const tabs=[["aiisms","AI-isms",true],["pacing","Pacing",false],["repeats","Repeats",false],["patterns","Patterns",false],["show-tell","Show vs Tell",true],["dialogue","Dialogue",true],["tension","Tension",true],["export","Export",false]];
   return<div style={{display:"flex",gap:"0.2rem",marginBottom:"1.25rem",borderBottom:"1px solid #1e293b",overflowX:"auto"}}>
     {tabs.map(([id,label,api])=>{const a=active===id;return<button key={id} onClick={()=>onChange(id)} style={{background:"transparent",border:"none",borderBottom:`2px solid ${a?id==="export"?"#4ade80":"#ef4444":"transparent"}`,padding:"0.55rem 0.75rem",cursor:"pointer",...S.mono,fontSize:"0.64rem",color:a?"#f1f5f9":"#475569",letterSpacing:"0.07em",textTransform:"uppercase",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:"0.3rem"}}>
       {label}{api&&<span style={{fontSize:"0.48rem",color:a?"#ef4444":"#334155"}}>◆</span>}
@@ -466,6 +625,202 @@ function RepeatsTab({repeats}){
     </div>}
   </div>;
 }
+
+// ─── TAB 3b: PATTERNS ────────────────────────────────────────────────────────
+
+function PatternRow({ label, count, color, children, defaultOpen=false }) {
+  const [open, setOpen] = React.useState(defaultOpen);
+  const ok = count === 0;
+  return (
+    <div style={{ marginBottom:"0.6rem" }}>
+      <div onClick={()=>setOpen(!open)} style={{ display:"flex", alignItems:"center", gap:"0.75rem", padding:"0.65rem 0.85rem", background:"#0f172a", border:`1px solid ${ok?"#166534":open?color+"55":"#1e293b"}`, borderLeft:`3px solid ${ok?"#166534":color}`, borderRadius:"4px", cursor:"pointer" }}>
+        <span style={{ ...S.mono, fontSize:"0.62rem", color:ok?"#4ade80":color, minWidth:"1.2rem", fontWeight:700 }}>{ok?"✓":count}</span>
+        <span style={{ ...S.mono, fontSize:"0.68rem", color:ok?"#4ade80":"#cbd5e1", flex:1 }}>{label}</span>
+        {!ok && <span style={{ ...S.mono, fontSize:"0.58rem", color:"#475569" }}>{open?"▲":"▼"}</span>}
+      </div>
+      {open && !ok && <div style={{ background:"#080f1f", border:"1px solid #1e293b", borderTop:"none", borderRadius:"0 0 4px 4px", padding:"0.75rem 0.85rem" }}>{children}</div>}
+    </div>
+  );
+}
+
+function PatternPill({ text, color }) {
+  return <span style={{ display:"inline-block", background:color+"18", border:`1px solid ${color}44`, borderRadius:"3px", padding:"0.15rem 0.5rem", ...S.mono, fontSize:"0.65rem", color:color, margin:"0.2rem 0.2rem 0.2rem 0" }}>{text}</span>;
+}
+
+function PatternsTab({ wordCount, patterns }) {
+  if (!patterns) return <Empty msg="Paste at least 50 words to see pattern analysis"/>;
+
+  const tricolorThresh = Math.floor(patterns.totalWords / 300);
+  const triOverused = patterns.tricolons.length > Math.max(tricolorThresh, 2);
+  const hasListStack = patterns.stackedParas.length > 0 || patterns.doubleStacks.length > 0;
+  const hasFigStack = patterns.figStacks.length > 0;
+  const hasContrastStack = patterns.contrastStacks.length > 0;
+  const hasPivots = patterns.pivots.length > 0;
+  const hasShorthandStack = patterns.shorthandStacks.length > 0;
+
+  const issueCount = [triOverused, hasListStack, hasFigStack, hasContrastStack, hasPivots, hasShorthandStack].filter(Boolean).length;
+
+  return (
+    <div>
+      {/* Summary bar */}
+      <div style={{ ...S.card, marginBottom:"1rem" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:"0.5rem" }}>
+          <span style={S.label}>Pattern Analysis</span>
+          <span style={{ ...S.mono, fontSize:"0.72rem", color:issueCount===0?"#4ade80":issueCount<=2?"#facc15":"#ef4444" }}>
+            {issueCount === 0 ? "✓ No issues" : `${issueCount} pattern${issueCount>1?"s":""} flagged`}
+          </span>
+        </div>
+        <div style={{ display:"flex", gap:"0.4rem", flexWrap:"wrap" }}>
+          {[
+            [`${patterns.tricolons.length} tricolon${patterns.tricolons.length!==1?"s":""}`, triOverused?"#f59e0b":"#4ade80"],
+            [`${patterns.contrasts.length} contrast${patterns.contrasts.length!==1?"s":""}`, hasContrastStack?"#f97316":"#4ade80"],
+            [`${patterns.allFigurative.length} figurative`, hasFigStack?"#a855f7":"#4ade80"],
+            [`${patterns.listySentences.length} list sent.`, hasListStack?"#ef4444":"#4ade80"],
+            [`${patterns.pivots.length} pivot${patterns.pivots.length!==1?"s":""}`, hasPivots?"#06b6d4":"#4ade80"],
+            [`${patterns.allShorthand.length} emo. shorthand`, hasShorthandStack?"#ec4899":"#4ade80"],
+          ].map(([l,c])=><PatternPill key={l} text={l} color={c}/>)}
+        </div>
+      </div>
+
+      {/* 1. Rule of Three */}
+      <PatternRow label={`Rule of Three  ·  ${patterns.tricolons.length} detected${triOverused?" — may be overused":""}`} count={triOverused?patterns.tricolons.length:0} color="#f59e0b" defaultOpen={triOverused}>
+        <p style={{ ...S.mono, fontSize:"0.65rem", color:"#94a3b8", marginBottom:"0.75rem", lineHeight:1.6 }}>
+          Tricolons are powerful when used sparingly. More than {Math.max(tricolorThresh,2)} in a chapter can feel formulaic — especially if items don't escalate. Each should earn its structure.
+        </p>
+        {patterns.tricolons.slice(0,8).map((t,i)=>(
+          <div key={i} style={{ marginBottom:"0.5rem", paddingBottom:"0.5rem", borderBottom:i<Math.min(patterns.tricolons.length,8)-1?"1px solid #1e293b":"none" }}>
+            <blockquote style={{ ...S.display, fontSize:"0.83rem", color:"#fbbf24", fontStyle:"italic", margin:"0 0 0.3rem 0", lineHeight:1.5 }}>"{t.text}"</blockquote>
+            <div style={{ display:"flex", gap:"0.4rem", flexWrap:"wrap" }}>
+              {t.items.map((item,j)=><span key={j} style={{ ...S.mono, fontSize:"0.6rem", color:"#64748b" }}>[{j+1}] {item.trim()}</span>)}
+            </div>
+          </div>
+        ))}
+        {patterns.tricolons.length > 8 && <p style={{ ...S.mono, fontSize:"0.62rem", color:"#475569", marginTop:"0.5rem" }}>…and {patterns.tricolons.length-8} more</p>}
+      </PatternRow>
+
+      {/* 2. List rhythm stacking */}
+      <PatternRow label={`List Rhythm Stacking  ·  ${patterns.listySentences.length} comma-heavy sentences${hasListStack?" — stacking detected":""}`} count={hasListStack?(patterns.stackedParas.length+patterns.doubleStacks.length):0} color="#ef4444">
+        <p style={{ ...S.mono, fontSize:"0.65rem", color:"#94a3b8", marginBottom:"0.75rem", lineHeight:1.6 }}>
+          Multiple list-structured sentences in the same paragraph create a breathless, AI-typical rhythm. Break them up with simple declarative sentences.
+        </p>
+        {patterns.doubleStacks.length > 0 && (
+          <div style={{ marginBottom:"0.75rem" }}>
+            <div style={{ ...S.mono, fontSize:"0.62rem", color:"#ef4444", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:"0.4rem" }}>Double-stacked sentences</div>
+            {patterns.doubleStacks.slice(0,4).map((s,i)=>(
+              <blockquote key={i} style={{ ...S.display, fontSize:"0.83rem", color:"#fca5a5", fontStyle:"italic", margin:"0 0 0.4rem 0", lineHeight:1.5 }}>"{s.slice(0,120)}{s.length>120?"...":""}"</blockquote>
+            ))}
+          </div>
+        )}
+        {patterns.stackedParas.length > 0 && (
+          <div>
+            <div style={{ ...S.mono, fontSize:"0.62rem", color:"#f97316", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:"0.4rem" }}>{patterns.stackedParas.length} paragraph{patterns.stackedParas.length>1?"s":""} with stacked list sentences</div>
+            <p style={{ ...S.mono, fontSize:"0.62rem", color:"#64748b", margin:0 }}>Vary sentence structure within these paragraphs — mix lists with simple action beats.</p>
+          </div>
+        )}
+      </PatternRow>
+
+      {/* 3. Metaphor / personification stacking */}
+      <PatternRow label={`Figurative Language  ·  ${patterns.allFigurative.length} detected${hasFigStack?" — stacking found":""}`} count={hasFigStack?patterns.figStacks.length:0} color="#a855f7">
+        <p style={{ ...S.mono, fontSize:"0.65rem", color:"#94a3b8", marginBottom:"0.75rem", lineHeight:1.6 }}>
+          Two or more metaphors, similes, or personifications in quick succession dilute each other. Let one land before reaching for the next.
+        </p>
+        {patterns.figStacks.slice(0,5).map((stack,i)=>(
+          <div key={i} style={{ background:"#0f172a", border:"1px solid #7c3aed44", borderLeft:"3px solid #a855f7", borderRadius:"3px", padding:"0.65rem 0.75rem", marginBottom:"0.5rem" }}>
+            <blockquote style={{ ...S.display, fontSize:"0.83rem", color:"#d8b4fe", fontStyle:"italic", margin:"0 0 0.35rem 0", lineHeight:1.5 }}>"{stack.context.slice(0,140)}{stack.context.length>140?"...":""}"</blockquote>
+            <div style={{ display:"flex", gap:"0.5rem", flexWrap:"wrap" }}>
+              <PatternPill text={stack.a.type} color="#a855f7"/>
+              <PatternPill text={stack.b.type} color="#a855f7"/>
+            </div>
+          </div>
+        ))}
+        {patterns.allFigurative.length > 0 && patterns.figStacks.length === 0 && (
+          <p style={{ ...S.mono, fontSize:"0.65rem", color:"#4ade80", margin:0 }}>✓ Figurative language is well-spaced — no stacking detected.</p>
+        )}
+      </PatternRow>
+
+      {/* 4. Contrast structures */}
+      <PatternRow label={`Contrast Structures  ·  ${patterns.contrasts.length} detected${hasContrastStack?" — stacking found":""}`} count={hasContrastStack?patterns.contrastStacks.length:0} color="#f97316">
+        <p style={{ ...S.mono, fontSize:"0.65rem", color:"#94a3b8", marginBottom:"0.75rem", lineHeight:1.6 }}>
+          "Not X, but Y" and "rather than X" constructions are rhetorical tools — effective once, flat when repeated. Multiple contrast structures in quick succession read as a stylistic tic.
+        </p>
+        {patterns.contrasts.length > 0 && (
+          <div style={{ marginBottom:"0.75rem" }}>
+            <div style={{ ...S.mono, fontSize:"0.62rem", color:"#f97316", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:"0.4rem" }}>All contrast patterns found</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:"0.3rem" }}>
+              {patterns.contrasts.slice(0,12).map((c,i)=>(
+                <span key={i} style={{ ...S.mono, fontSize:"0.62rem", color:"#fed7aa", background:"rgba(249,115,22,0.1)", border:"1px solid rgba(249,115,22,0.25)", borderRadius:"3px", padding:"0.15rem 0.5rem" }}>{c.text.slice(0,50)}{c.text.length>50?"...":""}</span>
+              ))}
+            </div>
+          </div>
+        )}
+        {hasContrastStack && (
+          <div>
+            <div style={{ ...S.mono, fontSize:"0.62rem", color:"#ef4444", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:"0.4rem" }}>Stacked contrasts (within 300 chars of each other)</div>
+            {patterns.contrastStacks.slice(0,3).map((pair,i)=>(
+              <div key={i} style={{ marginBottom:"0.5rem" }}>
+                <blockquote style={{ ...S.display, fontSize:"0.83rem", color:"#fdba74", fontStyle:"italic", margin:"0 0 0.2rem 0" }}>"{pair[0].text}"</blockquote>
+                <blockquote style={{ ...S.display, fontSize:"0.83rem", color:"#fdba74", fontStyle:"italic", margin:0 }}>"{pair[1].text}"</blockquote>
+              </div>
+            ))}
+          </div>
+        )}
+        {!hasContrastStack && patterns.contrasts.length > 0 && (
+          <p style={{ ...S.mono, fontSize:"0.65rem", color:"#4ade80", margin:0, marginTop:"0.5rem" }}>✓ Contrast structures are well-distributed — no stacking detected.</p>
+        )}
+      </PatternRow>
+
+      {/* 5. Clean pivot sentences */}
+      <PatternRow label={`Clean Pivot Sentences  ·  ${patterns.pivots.length} detected`} count={patterns.pivots.length} color="#06b6d4">
+        <p style={{ ...S.mono, fontSize:"0.65rem", color:"#94a3b8", marginBottom:"0.75rem", lineHeight:1.6 }}>
+          Formulaic wrap-up lines — "With that,", "That changed everything.", "There was no going back." — are a hallmark of AI prose. They close scenes too neatly, robbing the reader of ambiguity and weight. Replace with a specific, concrete beat.
+        </p>
+        {patterns.pivots.slice(0,10).map((p,i)=>(
+          <div key={i} style={{ background:"#0f172a", border:"1px solid #0e7490", borderLeft:"3px solid #06b6d4", borderRadius:"3px", padding:"0.6rem 0.75rem", marginBottom:"0.4rem" }}>
+            <div style={{ ...S.mono, fontSize:"0.65rem", color:"#22d3ee", marginBottom:"0.25rem" }}>"{p.text}"</div>
+            <p style={{ ...S.serif, fontSize:"0.78rem", color:"#64748b", margin:0, fontStyle:"italic", lineHeight:1.5 }}>{p.sentence.slice(0,110)}{p.sentence.length>110?"...":""}</p>
+          </div>
+        ))}
+        {patterns.pivots.length > 10 && <p style={{ ...S.mono, fontSize:"0.62rem", color:"#475569", marginTop:"0.5rem" }}>…and {patterns.pivots.length-10} more</p>}
+      </PatternRow>
+
+      {/* 6. Emotional shorthand stacking */}
+      <PatternRow label={`Emotional Shorthand  ·  ${patterns.allShorthand.length} detected${hasShorthandStack?" — stacking found":""}`} count={hasShorthandStack?patterns.shorthandStacks.length:0} color="#ec4899">
+        <p style={{ ...S.mono, fontSize:"0.65rem", color:"#94a3b8", marginBottom:"0.75rem", lineHeight:1.6 }}>
+          Pre-packaged physical emotion signals — "heart sank", "breath caught", "stomach dropped" — are useful shorthand but become AI-typical when stacked. Two or more in close proximity flattens the emotional impact of both. Space them out or replace with specific physical behaviour.
+        </p>
+        {patterns.shorthandStacks.length > 0 && (
+          <div style={{ marginBottom:"0.75rem" }}>
+            <div style={{ ...S.mono, fontSize:"0.62rem", color:"#ec4899", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:"0.5rem" }}>Stacked instances</div>
+            {patterns.shorthandStacks.slice(0,5).map((stack,i)=>(
+              <div key={i} style={{ background:"#0f172a", border:"1px solid #be185d44", borderLeft:"3px solid #ec4899", borderRadius:"3px", padding:"0.6rem 0.75rem", marginBottom:"0.5rem" }}>
+                <blockquote style={{ ...S.display, fontSize:"0.83rem", color:"#f9a8d4", fontStyle:"italic", margin:"0 0 0.4rem 0", lineHeight:1.5 }}>"{stack.context.slice(0,150)}{stack.context.length>150?"...":""}"</blockquote>
+                <div style={{ display:"flex", gap:"0.4rem", flexWrap:"wrap" }}>
+                  <PatternPill text={stack.a.label} color="#ec4899"/>
+                  <PatternPill text={stack.b.label} color="#ec4899"/>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {patterns.allShorthand.length > 0 && (
+          <div>
+            <div style={{ ...S.mono, fontSize:"0.62rem", color:"#475569", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:"0.4rem" }}>All shorthand detected</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:"0.3rem" }}>
+              {patterns.allShorthand.slice(0,16).map((s,i)=>(
+                <span key={i} style={{ ...S.mono, fontSize:"0.6rem", color:"#f9a8d4", background:"rgba(236,72,153,0.1)", border:"1px solid rgba(236,72,153,0.25)", borderRadius:"3px", padding:"0.15rem 0.45rem" }}>{s.text.slice(0,40)}</span>
+              ))}
+              {patterns.allShorthand.length > 16 && <span style={{ ...S.mono, fontSize:"0.6rem", color:"#475569" }}>+{patterns.allShorthand.length-16} more</span>}
+            </div>
+          </div>
+        )}
+        {patterns.allShorthand.length === 0 && (
+          <p style={{ ...S.mono, fontSize:"0.65rem", color:"#4ade80", margin:0 }}>✓ No emotional shorthand detected.</p>
+        )}
+      </PatternRow>
+    </div>
+  );
+}
+
 
 const ST_SYS=`Analyse fiction for show-vs-tell balance. Return ONLY valid JSON: {"showCount":<int>,"tellCount":<int>,"ratio":<0-100>,"summary":"2-3 sentences","tellingExamples":[{"text":"<exact>","issue":"<what>","rewrite":"<show it>"}],"showingExamples":[{"text":"<exact>","strength":"<what works>"}]}. Max 6 telling, 3 showing.`;
 
@@ -610,6 +965,7 @@ function App(){
   const pacing=React.useMemo(()=>computePacing(text,wordCount),[text,wordCount]);
   const repeats=React.useMemo(()=>computeRepeats(text,wordCount),[text,wordCount]);
   const dialogueMeta=React.useMemo(()=>computeDialogueMeta(text,wordCount),[text,wordCount]);
+  const patterns=React.useMemo(()=>computePatterns(text,wordCount),[text,wordCount]);
 
   const handleTextChange=t=>{setText(t);if(Math.abs(countWords(t)-wordCount)>20){setAiisms(null);setShowTell(null);setDialogue(null);setTension(null);}};
   const onNoKey=()=>setShowSettings(true);
@@ -622,7 +978,7 @@ function App(){
           <div>
             <div style={{...S.mono,fontSize:"0.65rem",color:"#ef4444",letterSpacing:"0.2em",textTransform:"uppercase",marginBottom:"0.5rem"}}>◆ Editorial Analysis Suite · v2</div>
             <h1 style={{fontFamily:"Georgia,serif",fontSize:"clamp(1.8rem,5vw,2.6rem)",fontWeight:700,margin:"0 0 0.4rem 0",lineHeight:1.1,color:"#f1f5f9"}}>The Red Pen</h1>
-            <p style={{...S.mono,fontSize:"0.7rem",color:"#475569",margin:0}}>AI-isms · Pacing · Repeats · Show vs Tell · Dialogue · Tension</p>
+            <p style={{...S.mono,fontSize:"0.7rem",color:"#475569",margin:0}}>AI-isms · Pacing · Repeats · Patterns · Show vs Tell · Dialogue · Tension</p>
           </div>
           <button onClick={()=>setShowSettings(true)} title="API Settings" style={{background:"#0f172a",border:"1px solid #1e293b",borderRadius:"4px",padding:"0.5rem 0.75rem",cursor:"pointer",...S.mono,fontSize:"0.65rem",color:"#475569",marginTop:"0.5rem"}} onMouseEnter={e=>{e.currentTarget.style.borderColor="#334155";e.currentTarget.style.color="#94a3b8";}} onMouseLeave={e=>{e.currentTarget.style.borderColor="#1e293b";e.currentTarget.style.color="#475569";}}>⚙ API</button>
         </div>
@@ -631,6 +987,7 @@ function App(){
         {tab==="aiisms"   &&<AIismsTab   text={text} wordCount={wordCount} result={aiisms}   setResult={setAiisms}   onNoKey={onNoKey}/>}
         {tab==="pacing"   &&<PacingTab   pacing={pacing}/>}
         {tab==="repeats"  &&<RepeatsTab  repeats={repeats}/>}
+        {tab==="patterns" &&<PatternsTab wordCount={wordCount} patterns={patterns}/>}
         {tab==="show-tell"&&<ShowTellTab text={text} wordCount={wordCount} result={showTell} setResult={setShowTell} onNoKey={onNoKey}/>}
         {tab==="dialogue" &&<DialogueTab text={text} wordCount={wordCount} result={dialogue} setResult={setDialogue} dialogueMeta={dialogueMeta} onNoKey={onNoKey}/>}
         {tab==="tension"  &&<TensionTab  text={text} wordCount={wordCount} result={tension}  setResult={setTension}  onNoKey={onNoKey}/>}
